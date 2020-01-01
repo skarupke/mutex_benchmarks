@@ -603,6 +603,68 @@ private:
 	std::atomic<bool> locked{ false };
 };
 
+/* MCS lock:
+ * https://people.csail.mit.edu/nickolai/papers/boyd-wickizer-locks.pdf
+ *
+ * This is a fair lock, the lock passes through the threads as they
+ * try to acquire it */
+pthread_key_t mcs_key;
+
+static void make_mcs_key()
+{
+	pthread_key_create( &mcs_key, nullptr );
+}
+
+struct mcs_lock
+{
+	struct mcs_local /* thread local data */
+	{
+		mcs_local *next = nullptr;
+		std::atomic<uint32_t> wait{ 0 };
+		/* ensure a different cache line */
+		char pad[ 64 - ( sizeof( mcs_local * ) + sizeof( uint32_t ) ) ];
+	};
+
+	void lock()
+	{
+		void * p;
+		if ( (p = pthread_getspecific( mcs_key )) == nullptr )
+		{
+			p = new mcs_local();
+			pthread_setspecific( mcs_key, p );
+		}
+		mcs_local * local = (mcs_local *) p, /* my local data */
+			  * owner;
+
+		/* if lock is already owned by another thread */
+		if ( (owner = link.exchange( local )) != nullptr )
+		{
+			/* add myself to the list of waiting threads */
+			owner->next = local;
+			/* wait for owner to signal my turn */
+			while ( local->wait.exchange( 0 ) == 0 )
+				_mm_pause();
+		}
+	}
+	void unlock()
+	{
+		mcs_local * local = (mcs_local *) pthread_getspecific( mcs_key ), /* my local data */
+			  * me    = local,
+			  * waiting;
+		/* if I am not the head thread, then other threads are waiting */
+		if ( ! link.compare_exchange_strong( me, nullptr, std::memory_order_acquire ) )
+		{
+			/* wait for the link to appear */
+			while ( (waiting = local->next) == nullptr )
+				_mm_pause();
+			local->next = nullptr; /* clear link */
+			waiting->wait = 1; /* signal next thread */
+		}
+	}
+	/* linked list of waiters */
+	std::atomic<mcs_local *> link{ nullptr };
+};
+
 template<int SpinNoOpCount, int SpinPauseCount, bool ResetCountAfterYield>
 struct parameterized_spinlock
 {
@@ -701,6 +763,7 @@ void benchmark_mutex_lock_unlock(benchmark::State& state)
     BENCHMARK_TEMPLATE(benchmark, spinlock_compare_exchange) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, spinlock_compare_exchange_only) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, terrible_spinlock) __VA_ARGS__;\
+    BENCHMARK_TEMPLATE(benchmark, mcs_lock) __VA_ARGS__;\
     /*BENCHMARK_TEMPLATE(benchmark, parameterized_spinlock<0, 0>) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, parameterized_spinlock<0, 1>) __VA_ARGS__;\
     BENCHMARK_TEMPLATE(benchmark, parameterized_spinlock<0, 4>) __VA_ARGS__;\
@@ -1688,6 +1751,7 @@ BENCHMARK(benchmark_yield);
 
 int main(int argc, char* argv[])
 {
+	make_mcs_key();
 	::benchmark::Initialize(&argc, argv);
 	::benchmark::RunSpecifiedBenchmarks();
 }
